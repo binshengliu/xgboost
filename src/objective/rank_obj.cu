@@ -73,11 +73,15 @@ struct ListEntry {
   bst_float pred;
   /*! \brief the actual label of the entry */
   bst_float label;
+  /*! \brief the lower bound of the label*/
+  bst_float lower;
+  /*! \brief the upper bound of the label */
+  bst_float upper;
   /*! \brief row index in the data matrix */
   unsigned rindex;
   // constructor
-  ListEntry(bst_float pred, bst_float label, unsigned rindex)
-    : pred(pred), label(label), rindex(rindex) {}
+  ListEntry(bst_float pred, bst_float label, bst_float lower, bst_float upper, unsigned rindex)
+      : pred(pred), label(label), lower(lower), upper(upper), rindex(rindex) {}
   // comparator by prediction
   inline static bool CmpPred(const ListEntry &a, const ListEntry &b) {
     return a.pred > b.pred;
@@ -645,8 +649,9 @@ class SortedLabelList : dh::SegmentSorter<float> {
   void ComputeGradients(const bst_float *dpreds,   // Unsorted predictions
                         const bst_float *dlabels,  // Unsorted labels
                         const HostDeviceVector<bst_float> &weights,
-                        int iter,
-                        GradientPair *out_gpair,
+                        const HostDeviceVector<bst_float> &lower,
+                        const HostDeviceVector<bst_float> &upper,
+                        int iter, GradientPair *out_gpair,
                         float weight_normalization_factor) {
     // Group info on device
     const auto &dgroups = this->GetGroupsSpan();
@@ -661,6 +666,10 @@ class SortedLabelList : dh::SegmentSorter<float> {
 
     uint32_t num_weights = weights.Size();
     auto dweights = num_weights ? weights.ConstDevicePointer() : nullptr;
+
+    bool has_bound = (lower.Size() == this->GetNumItems()) && (upper.Size() == this->GetNumItems());
+    auto dlower = has_bound ? lower.ConstDevicePointer() : nullptr;
+    auto dupper = has_bound ? upper.ConstDevicePointer() : nullptr;
 
     const auto &sorted_labels = this->GetItemsSpan();
 
@@ -716,6 +725,9 @@ class SortedLabelList : dh::SegmentSorter<float> {
         neg_idx = sample + items_in_group + group_begin;
       }
 
+      if (has_bound && (dlower[original_pos[pos_idx]] <= dupper[original_pos[neg_idx]])) {
+        return;
+      }
       // Compute and assign the gradients now
       const float eps = 1e-16f;
       bst_float p = common::Sigmoid(dpreds[original_pos[pos_idx]] - dpreds[original_pos[neg_idx]]);
@@ -818,6 +830,19 @@ class LambdaRankObj : public ObjFunction {
 
     const auto& preds_h = preds.HostVector();
     const auto& labels = info.labels.HostView();
+    const bst_float* lower;
+    const bst_float* upper;
+    bst_ulong lower_len = 0;
+    bst_ulong upper_len = 0;
+    bool has_bound = true;
+    info.GetInfo("label_lower_bound", &lower_len, DataType::kFloat32, reinterpret_cast<void const**>(&lower));
+    info.GetInfo("label_upper_bound", &upper_len, DataType::kFloat32, reinterpret_cast<void const**>(&upper));
+    has_bound = (lower_len == labels.Shape(0)) && (upper_len == labels.Shape(0));
+    if ((upper_len > 0 || lower_len > 0) && !has_bound) {
+      LOG(WARNING) << "Label bound specified but mismatch label size " << lower_len << " " << upper_len
+                   << " " << labels.Shape(0);
+    }
+
     std::vector<GradientPair>& gpair = out_gpair->HostVector();
     const auto ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
     out_gpair->Resize(preds.Size());
@@ -838,7 +863,11 @@ class LambdaRankObj : public ObjFunction {
           exc.Run([&]() {
             lst.clear(); pairs.clear();
             for (unsigned j = gptr[k]; j < gptr[k+1]; ++j) {
-              lst.emplace_back(preds_h[j], labels(j), j);
+              if (has_bound) {
+                lst.emplace_back(preds_h[j], labels(j), lower[j], upper[j], j);
+              } else {
+                lst.emplace_back(preds_h[j], labels(j), 1.0, 0.0, j);
+              }
               gpair[j] = GradientPair(0.0f, 0.0f);
             }
             std::stable_sort(lst.begin(), lst.end(), ListEntry::CmpPred);
@@ -860,13 +889,19 @@ class LambdaRankObj : public ObjFunction {
                   for (unsigned pid = i; pid < j; ++pid) {
                     unsigned ridx =
                         std::uniform_int_distribution<unsigned>(0, nleft + nright - 1)(rnd);
+                    unsigned pos_idx, neg_idx;
                     if (ridx < nleft) {
-                      pairs.emplace_back(rec[ridx].second, rec[pid].second,
-                          info.GetWeight(k) * weight_normalization_factor);
+                      pos_idx = rec[ridx].second;
+                      neg_idx = rec[pid].second;
                     } else {
-                      pairs.emplace_back(rec[pid].second, rec[ridx+j-i].second,
-                          info.GetWeight(k) * weight_normalization_factor);
+                      pos_idx = rec[pid].second;
+                      neg_idx = rec[ridx+j-i].second;
                     }
+                    if (has_bound && lst[pos_idx].lower <= lst[neg_idx].upper) {
+                      continue;
+                    }
+                    pairs.emplace_back(pos_idx, neg_idx,
+                                       info.GetWeight(k) * weight_normalization_factor);
                   }
                 }
               }
@@ -916,6 +951,8 @@ class LambdaRankObj : public ObjFunction {
     info.labels.SetDevice(device);
     preds.SetDevice(device);
     info.weights_.SetDevice(device);
+    info.labels_lower_bound_.SetDevice(device);
+    info.labels_upper_bound_.SetDevice(device);
 
     out_gpair->Resize(preds.Size());
 
@@ -933,6 +970,7 @@ class LambdaRankObj : public ObjFunction {
 
     // Finally, compute the gradients
     slist.ComputeGradients<LambdaWeightComputerT>(d_preds, d_labels.Values().data(), info.weights_,
+                                                  info.labels_lower_bound_, info.labels_upper_bound_,
                                                   iter, d_gpair, weight_normalization_factor);
   }
 #endif
